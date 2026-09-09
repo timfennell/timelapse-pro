@@ -168,14 +168,20 @@ def process_frame(rgb16: np.ndarray,
                   meta:  FrameMeta,
                   H,                   # warp matrix (or None)
                   crop:  tuple,        # (x, y, w, h) output crop
-                  do_tilt: bool) -> np.ndarray:
+                  do_tilt: bool,
+                  do_slog3: bool = True) -> np.ndarray:
     """
     Pipeline for one frame:
       1. Normalise rawpy 16-bit linear to float [0,1]
       2. Apply sidecar exposure correction (linear multiply)
       3. Perspective warp + crop
-      4. S-Log3 encode
+      4. S-Log3 encode (optional)
       5. Return uint16 [0,65535]
+
+    do_slog3=False leaves the frame scene-linear, which decode_raw already
+    produced with gamma=(1, 1). Log encoding earns its place in a ProRes file
+    destined for a grade; in a TIFF headed for a raw editor it is just a curve
+    that has to be undone, so the TIFF path can turn it off.
     """
     frame = rgb16.astype(np.float32) / 65535.0
 
@@ -199,7 +205,9 @@ def process_frame(rgb16: np.ndarray,
 
     # 4. S-Log3
     frame = np.clip(frame, 0.0, None)
-    frame = np.clip(slog3(frame), 0.0, 1.0)
+    if do_slog3:
+        frame = slog3(frame)
+    frame = np.clip(frame, 0.0, 1.0)
 
     return (frame * 65535.0).astype(np.uint16)
 
@@ -222,12 +230,15 @@ def get_focal_mm(arw_path: Path) -> float:
 class Pipeline:
     def __init__(self, input_dir: Path, output_path: Path, fps: int,
                  do_tilt: bool, do_ec: bool,
+                 output_format: str = "prores", do_slog3: bool = True,
                  on_progress=None, on_log=None, on_done=None):
         self.input_dir   = input_dir
-        self.output_path = output_path
+        self.output_path = output_path      # .mov file, or directory for tiff
         self.fps         = fps
         self.do_tilt     = do_tilt
         self.do_ec       = do_ec
+        self.output_format = output_format  # "prores" | "tiff"
+        self.do_slog3    = do_slog3
         self._progress   = on_progress or (lambda n, t: None)
         self._log        = on_log      or print
         self._done       = on_done     or (lambda ok, m: None)
@@ -298,6 +309,11 @@ class Pipeline:
         crop = (x0, y0, cw, ch)
         self._log(f"Output dimensions: {cw} × {ch}")
 
+        # ── TIFF sequence branch ─────────────────────────────────────────────
+        if self.output_format == "tiff":
+            self._run_tiff(frames, crop, cw, ch, fw, fh)
+            return
+
         # ── Start ffmpeg ─────────────────────────────────────────────────────
         self._log("Starting ffmpeg ProRes 4444 encoder…")
         cmd = [
@@ -339,7 +355,8 @@ class Pipeline:
                 if self.do_tilt and m.tilt_deg != 0.0:
                     H, _ = warp_matrix(m.tilt_deg, m.focal_mm, fw, fh)
 
-                out16 = process_frame(rgb16, m, H, crop, do_tilt=self.do_tilt)
+                out16 = process_frame(rgb16, m, H, crop, do_tilt=self.do_tilt,
+                                      do_slog3=self.do_slog3)
 
                 # rgb48le = little-endian uint16 R G B — matches numpy uint16
                 ff.stdin.write(out16.tobytes())
@@ -361,6 +378,86 @@ class Pipeline:
         size_mb = self.output_path.stat().st_size / 1e6
         self._done(True,
             f"Done — {total} frames → {self.output_path.name}  "
+            f"({size_mb:.0f} MB)")
+
+    # ── TIFF sequence output ──────────────────────────────────────────────────
+
+    def _run_tiff(self, frames, crop, cw: int, ch: int, fw: int, fh: int):
+        """Write one 16-bit RGB TIFF per frame instead of encoding a movie.
+
+        Same decode, exposure, warp and crop as the ProRes path — only the
+        container differs — so a sequence can be graded in a raw editor such as
+        darktable, or fed to the stills pipeline (matting, focus stacking,
+        photogrammetry), none of which can read a ProRes file.
+
+        tifffile is imported here rather than at module scope so that the
+        ProRes path keeps working when it is not installed.
+        """
+        try:
+            import tifffile
+        except ImportError:
+            self._done(False, "TIFF output needs tifffile.\n"
+                              "Install with:  pip3 install tifffile")
+            return
+
+        out_dir = self.output_path
+        try:
+            out_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            self._done(False, f"Could not create output folder:\n{e}")
+            return
+
+        total = len(frames)
+        # 16-bit RGB is 6 bytes a pixel and these frames are large, so say up
+        # front roughly what this will cost on disk. Deflate is lossless and
+        # typically recovers a third or so of that.
+        raw_gb = cw * ch * 6 * total / 1e9
+        self._log(f"Pass 2: decoding RAW → EC → tilt →"
+                  f"{' S-Log3 →' if self.do_slog3 else ''} 16-bit TIFF…")
+        if self.do_slog3:
+            self._log("  S-Log3 encoded — flat by design; apply a log-to-linear "
+                      "LUT or curve when grading")
+        else:
+            self._log("  scene-linear (no log curve) — these will look almost "
+                      "black until the editor is told they are linear")
+            self._log("  darktable: set the input profile to 'linear Rec709 RGB' "
+                      "and use filmic or sigmoid")
+        self._log(f"  ~{raw_gb:.1f} GB uncompressed for {total} frames, "
+                  f"less after deflate")
+
+        written = 0
+        for i, m in enumerate(frames):
+            if self._cancelled:
+                self._done(False, "Cancelled."); return
+
+            rgb16 = decode_raw(m.arw_path)
+
+            H = None
+            if self.do_tilt and m.tilt_deg != 0.0:
+                H, _ = warp_matrix(m.tilt_deg, m.focal_mm, fw, fh)
+
+            out16 = process_frame(rgb16, m, H, crop, do_tilt=self.do_tilt,
+                                  do_slog3=self.do_slog3)
+
+            # Keep the source stem so each TIFF still lines up with its ARW and
+            # its XMP sidecar; camera names are already in shooting order.
+            dest = out_dir / f"{m.arw_path.stem}.tif"
+            try:
+                tifffile.imwrite(str(dest), out16, photometric="rgb",
+                                 compression="zlib")
+            except Exception as e:
+                self._done(False, f"Failed writing {dest.name}:\n{e}")
+                return
+            written += 1
+
+            self._progress(i + 1, total)
+            if i < 3 or (i + 1) % 50 == 0 or i == total - 1:
+                self._log(f"  [{i+1:4d}/{total}]  {dest.name}"
+                          f"  tilt={m.tilt_deg:+.2f}°  EC={m.ec_stops:+.2f}EV")
+
+        size_mb = sum(f.stat().st_size for f in out_dir.glob("*.tif")) / 1e6
+        self._done(True,
+            f"Done — {written} TIFFs → {out_dir.name}{os.sep}  "
             f"({size_mb:.0f} MB)")
 
 
@@ -397,8 +494,22 @@ class App(tk.Tk):
         # I/O rows
         self._in_var  = tk.StringVar()
         self._out_var = tk.StringVar()
+        self._fmt_var = tk.StringVar(value="prores")
         self._io_row(body, "Input folder:", self._in_var,  self._browse_input)
-        self._io_row(body, "Output file:",  self._out_var, self._browse_output)
+        self._out_label = self._io_row(body, "Output file:", self._out_var,
+                                       self._browse_output)
+
+        # Output format
+        fmt = tk.LabelFrame(body, text="Output format", padx=8, pady=8)
+        fmt.pack(fill="x", pady=(4, 0))
+        tk.Radiobutton(fmt, text="ProRes 4444 movie  (.mov, for editing/grading)",
+                       variable=self._fmt_var, value="prores",
+                       command=self._on_format_change
+                       ).grid(row=0, column=0, sticky="w", padx=4, pady=2)
+        tk.Radiobutton(fmt, text="TIFF sequence  (16-bit, for darktable / stacking / COLMAP)",
+                       variable=self._fmt_var, value="tiff",
+                       command=self._on_format_change
+                       ).grid(row=1, column=0, sticky="w", padx=4, pady=2)
 
         # Options
         opts = tk.LabelFrame(body, text="Options", padx=8, pady=8)
@@ -417,6 +528,13 @@ class App(tk.Tk):
             text="Apply exposure correction  (crs:Exposure2012 from sidecar)",
             variable=self._ec_var
         ).grid(row=1, column=0, sticky="w", padx=4, pady=2)
+
+        self._slog_var = tk.BooleanVar(value=True)
+        self._slog_cb = tk.Checkbutton(opts,
+            text="S-Log3 tone curve  (leave off for scene-linear TIFFs)",
+            variable=self._slog_var
+        )
+        self._slog_cb.grid(row=2, column=0, sticky="w", padx=4, pady=2)
 
         rf = tk.Frame(opts)
         rf.grid(row=0, column=1, sticky="e", padx=16)
@@ -474,21 +592,51 @@ class App(tk.Tk):
     def _io_row(self, parent, label, var, cmd):
         f = tk.Frame(parent)
         f.pack(fill="x", pady=3)
-        tk.Label(f, text=label, width=13, anchor="w").pack(side="left")
+        lbl = tk.Label(f, text=label, width=13, anchor="w")
+        lbl.pack(side="left")
         tk.Entry(f, textvariable=var, width=50).pack(side="left", padx=4)
         tk.Button(f, text="Browse…", command=cmd).pack(side="left")
+        return lbl
 
     # ── File dialogs ──────────────────────────────────────────────────────────
+
+    def _on_format_change(self):
+        """Retarget the output row — a movie is a file, a sequence is a folder.
+
+        Also clears a stale path when switching, so a .mov left in the box does
+        not silently become the name of a directory full of TIFFs.
+        """
+        tiff = self._fmt_var.get() == "tiff"
+        self._out_label.config(text="Output folder:" if tiff else "Output file:")
+        cur = self._out_var.get().strip()
+        if cur and (cur.lower().endswith(".mov") == tiff):
+            self._out_var.set("")
+        if not self._out_var.get():
+            self._suggest_output()
+
+    def _suggest_output(self):
+        d = self._in_var.get().strip()
+        if not d:
+            return
+        name = Path(d).name
+        if self._fmt_var.get() == "tiff":
+            self._out_var.set(str(Path(d).parent / f"{name}_tiff"))
+        else:
+            self._out_var.set(str(Path(d).parent / f"{name}_prores4444.mov"))
 
     def _browse_input(self):
         d = filedialog.askdirectory(title="Select folder containing ARW files")
         if d:
             self._in_var.set(d)
             if not self._out_var.get():
-                name = Path(d).name
-                self._out_var.set(str(Path(d).parent / f"{name}_prores4444.mov"))
+                self._suggest_output()
 
     def _browse_output(self):
+        if self._fmt_var.get() == "tiff":
+            d = filedialog.askdirectory(title="Select folder for the TIFF sequence")
+            if d:
+                self._out_var.set(d)
+            return
         f = filedialog.asksaveasfilename(
             title="Save ProRes 4444 video as…",
             defaultextension=".mov",
@@ -522,8 +670,17 @@ class App(tk.Tk):
         if not inp or not Path(inp).is_dir():
             messagebox.showerror("TimelapsePro", "Please select a valid input folder.")
             return
+        is_tiff = self._fmt_var.get() == "tiff"
         if not out:
-            messagebox.showerror("TimelapsePro", "Please choose an output file path.")
+            messagebox.showerror("TimelapsePro",
+                "Please choose an output folder." if is_tiff
+                else "Please choose an output file path.")
+            return
+        # Writing a sequence into the folder we are reading would interleave
+        # TIFFs with the ARWs and make a rerun pick up its own output.
+        if is_tiff and Path(out).resolve() == Path(inp).resolve():
+            messagebox.showerror("TimelapsePro",
+                "Choose an output folder other than the input folder.")
             return
 
         self._log_txt.config(state="normal")
@@ -541,6 +698,8 @@ class App(tk.Tk):
             fps         = int(self._fps_var.get()),
             do_tilt     = self._tilt_var.get(),
             do_ec       = self._ec_var.get(),
+            output_format = self._fmt_var.get(),
+            do_slog3    = self._slog_var.get(),
             on_progress = self._on_progress,
             on_log      = self._enqueue_log,
             on_done     = self._on_done,
