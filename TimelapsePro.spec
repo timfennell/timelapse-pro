@@ -2,9 +2,15 @@
 #
 # Build:  pyinstaller TimelapsePro.spec        (from this directory, in the venv)
 #
-# Kept as one-file to match how this app has always been shipped. If launch
-# feels slow, switching to a COLLECT/one-dir bundle (as MattePro uses) avoids
-# re-extracting rawpy, cv2 and numpy on every start.
+# One-dir bundle. This was previously one-file, but PyInstaller rejects that
+# combination for macOS .app bundles:
+#
+#   DEPRECATION: Onefile mode in combination with macOS .app bundles (windowed
+#   mode) don't make sense (a .app bundle can not be a single file) and clashes
+#   with macOS's security. Please migrate to onedir mode. This will become an
+#   error in v7.0.
+#
+# It also meant re-extracting rawpy, cv2 and numpy on every launch.
 
 a = Analysis(
     ['timelapse_pro.py'],
@@ -33,16 +39,13 @@ pyz = PYZ(a.pure)
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.datas,
     [],
+    exclude_binaries=True,
     name='TimelapsePro',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
     upx=True,
-    upx_exclude=[],
-    runtime_tmpdir=None,
     console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
@@ -50,9 +53,17 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
 )
-app = BUNDLE(
+coll = COLLECT(
     exe,
+    a.binaries,
+    a.datas,
+    strip=False,
+    upx=True,
+    upx_exclude=[],
+    name='TimelapsePro',
+)
+app = BUNDLE(
+    coll,
     name='TimelapsePro.app',
-    icon=None,
     bundle_identifier='com.pislider.timelapsepro',
 )
